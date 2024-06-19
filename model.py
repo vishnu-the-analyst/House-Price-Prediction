@@ -1,117 +1,109 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from catboost import CatBoostRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.linear_model import RidgeCV
-from sklearn.ensemble import StackingRegressor
-from xgboost import XGBRegressor
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.feature_selection import RFECV
+from sklearn.svm import SVR
+import warnings
+warnings.filterwarnings('ignore')
 
 # Load data
 train = pd.read_csv('train.csv')
 test = pd.read_csv('test.csv')
-submission = pd.read_csv('sample_submission.csv')
 
-# Separate target variable
-y = train['SalePrice']
-train.drop(['SalePrice'], axis=1, inplace=True)
+# Combine train and test for uniform preprocessing
+train_v1 = pd.concat([train, test], sort=False)
 
-# Combine train and test data for preprocessing
-all_data = pd.concat([train, test], sort=False)
-
-# Identify numerical and categorical columns
-numeric_features = all_data.select_dtypes(include=['int64', 'float64']).columns
-categorical_features = all_data.select_dtypes(include=['object']).columns
-
-# Handle missing values for numerical features
-numeric_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler', StandardScaler())
-])
-
-# Handle missing values and encode categorical features
-categorical_transformer = Pipeline(steps=[
-    ('imputer', SimpleImputer(strategy='most_frequent')),
-    ('encoder', OneHotEncoder(handle_unknown='ignore'))
-])
-
-# Combine transformations
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', numeric_transformer, numeric_features),
-        ('cat', categorical_transformer, categorical_features)
-    ]
-)
-
-# Preprocess the data
-train_preprocessed = preprocessor.fit_transform(train)
-test_preprocessed = preprocessor.transform(test)
+# Fill missing values
+train_v1['LotFrontage'] = train_v1['LotFrontage'].fillna(train_v1['LotFrontage'].median())
+train_v1.drop(['Alley', 'MasVnrType', 'MasVnrArea'], axis=1, inplace=True)
+for col in ['BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'FireplaceQu', 'GarageType', 'GarageFinish', 'GarageQual', 'GarageCond', 'PoolQC', 'Fence', 'MiscFeature']:
+    train_v1[col] = train_v1[col].fillna('Not applicable')
+for col in ['GarageYrBlt', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF', 'BsmtFullBath', 'BsmtHalfBath', 'GarageArea', 'GarageCars']:
+    train_v1[col] = train_v1[col].fillna(0)
+for col in ['Electrical', 'MSZoning', 'Utilities', 'Exterior1st', 'Exterior2nd', 'KitchenQual', 'Functional', 'SaleType']:
+    train_v1[col] = train_v1[col].fillna(train_v1[col].mode()[0])
 
 # Feature Engineering
-additional_train_feature = (train['TotalBsmtSF'] + train['1stFlrSF'] + train['2ndFlrSF']).values.reshape(-1, 1)
-additional_test_feature = (test['TotalBsmtSF'] + test['1stFlrSF'] + test['2ndFlrSF']).values.reshape(-1, 1)
+train_v1['TotalSF'] = train_v1['TotalBsmtSF'] + train_v1['1stFlrSF'] + train_v1['2ndFlrSF']
+train_v1['TotalBathrooms'] = train_v1['FullBath'] + train_v1['BsmtFullBath'] + 0.5 * (train_v1['HalfBath'] + train_v1['BsmtHalfBath'])
+train_v1['TotalPorchSF'] = train_v1['OpenPorchSF'] + train_v1['3SsnPorch'] + train_v1['EnclosedPorch'] + train_v1['ScreenPorch'] + train_v1['WoodDeckSF']
+train_v1['HasPool'] = np.where(train_v1['PoolArea'] > 0, 1, 0)
+train_v1['Has2ndFloor'] = np.where(train_v1['2ndFlrSF'] > 0, 1, 0)
+train_v1['HasGarage'] = np.where(train_v1['GarageArea'] > 0, 1, 0)
+train_v1['HasBsmt'] = np.where(train_v1['TotalBsmtSF'] > 0, 1, 0)
+train_v1['HasFireplace'] = np.where(train_v1['Fireplaces'] > 0, 1, 0)
 
-train_preprocessed = np.hstack((train_preprocessed, additional_train_feature))
-test_preprocessed = np.hstack((test_preprocessed, additional_test_feature))
+# One-hot encoding
+train_encoded = pd.get_dummies(train_v1, columns=['MSSubClass', 'MSZoning', 'Street', 'LotShape', 'LandContour', 'Utilities', 'LotConfig', 'LandSlope',
+                                                  'Neighborhood', 'Condition1', 'Condition2', 'BldgType', 'HouseStyle', 'RoofStyle', 'RoofMatl', 
+                                                  'Exterior1st', 'Exterior2nd', 'ExterQual', 'ExterCond', 'Foundation', 'BsmtQual', 'BsmtCond', 
+                                                  'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'Heating', 'HeatingQC', 'CentralAir', 'Electrical', 
+                                                  'KitchenQual', 'Functional', 'FireplaceQu', 'GarageType', 'GarageFinish', 'GarageQual', 'GarageCond', 
+                                                  'PavedDrive', 'PoolQC', 'Fence', 'MiscFeature', 'SaleType', 'SaleCondition'], dtype=int)
 
+# Split train and test
+train_processed = train_encoded[train_encoded['SalePrice'].notna()].copy()
+test_processed = train_encoded[train_encoded['SalePrice'].isna()].copy()
 
-# Train/Test split for validation
-X_train, X_valid, y_train, y_valid = train_test_split(train_preprocessed, y, test_size=0.2, random_state=42)
+Y_train = train_processed['SalePrice']
+train_processed.drop(['SalePrice', 'Id'], axis=1, inplace=True)
+X_train = train_processed
 
-# Basic model
-model = RandomForestRegressor(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
+X_test = test_processed.drop(['SalePrice', 'Id'], axis=1)
 
-# Predictions
-y_pred = model.predict(X_valid)
-rmse = np.sqrt(mean_squared_error(y_valid, y_pred))
-print(f'Validation RMSE: {rmse}')
+# Train-test split for validation
+X_train, X_valid, Y_train, Y_valid = train_test_split(X_train, Y_train, test_size=0.2, random_state=42)
 
-# Hyperparameter tuning with GridSearchCV or RandomizedSearchCV
-param_dist = {
-    'n_estimators': [100, 200, 500],
-    'max_depth': [None, 10, 20, 30],
-    'min_samples_split': [2, 5, 10],
-    'min_samples_leaf': [1, 2, 4],
-    'bootstrap': [True, False]
-}
+# Feature Selection with RFECV
+rfecv = RFECV(estimator=CatBoostRegressor(verbose=0), step=1, cv=5, scoring='neg_mean_squared_error')
+rfecv.fit(X_train, Y_train)
 
-rf_random = RandomizedSearchCV(estimator=model, param_distributions=param_dist, n_iter=100, cv=3, verbose=2, random_state=42, n_jobs=-1)
-rf_random.fit(X_train, y_train)
-best_model = rf_random.best_estimator_
+X_train_selected = rfecv.transform(X_train)
+X_valid_selected = rfecv.transform(X_valid)
+X_test_selected = rfecv.transform(X_test)
 
+# Model Building with CatBoost, Gradient Boosting, Ridge, Lasso, ElasticNet, and Stacking
+catboost_model = CatBoostRegressor(verbose=0, iterations=1000, depth=8, learning_rate=0.05, l2_leaf_reg=3)
+gbr_model = GradientBoostingRegressor(n_estimators=1000, max_depth=8, learning_rate=0.05)
+ridge_model = Ridge(alpha=1.0)
+lasso_model = Lasso(alpha=0.01)
+elastic_model = ElasticNet(alpha=0.01, l1_ratio=0.5)
 
-# Define base models
-base_models = [
-    ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
-    ('xgb', XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42))
+# Train individual models
+catboost_model.fit(X_train_selected, Y_train)
+gbr_model.fit(X_train_selected, Y_train)
+ridge_model.fit(X_train_selected, Y_train)
+lasso_model.fit(X_train_selected, Y_train)
+elastic_model.fit(X_train_selected, Y_train)
+
+# Stacking Regressor
+estimators = [
+    ('catboost', catboost_model),
+    ('gbr', gbr_model),
+    ('ridge', ridge_model),
+    ('lasso', lasso_model),
+    ('elastic', elastic_model)
 ]
+stacking_model = StackingRegressor(estimators=estimators, final_estimator=CatBoostRegressor(verbose=0, iterations=1000, depth=8, learning_rate=0.05, l2_leaf_reg=3))
 
-# Define stacking model
-stacking_model = StackingRegressor(
-    estimators=base_models,
-    final_estimator=RidgeCV()
-)
+stacking_model.fit(X_train_selected, Y_train)
 
-stacking_model.fit(X_train, y_train)
+# Evaluate
+valid_preds_stacking = stacking_model.predict(X_valid_selected)
+rmse_stacking = mean_squared_error(Y_valid, valid_preds_stacking, squared=False)
+mae_stacking = mean_absolute_error(Y_valid, valid_preds_stacking)
+print(f'Stacking Model RMSE: {rmse_stacking}')
+print(f'Stacking Model MAE: {mae_stacking}')
 
-# Predictions
-stacking_preds = stacking_model.predict(X_valid)
-stacking_rmse = np.sqrt(mean_squared_error(y_valid, stacking_preds))
-print(f'Stacking Model Validation RMSE: {stacking_rmse}')
+# Predict on test set
+final_preds_stacking = stacking_model.predict(X_test_selected)
 
-
-# Final predictions on test set
-final_predictions = stacking_model.predict(test_preprocessed)
-
-# Create submission file
-submission['SalePrice'] = final_predictions
+# Submission
+submission = pd.DataFrame({'Id': test['Id'], 'SalePrice': final_preds_stacking})
 submission.to_csv('submission.csv', index=False)
-
-
